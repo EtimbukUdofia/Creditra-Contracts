@@ -9,15 +9,15 @@ This repo contains the **credit** contract: it maintains credit lines, tracks ut
 **Behavior notes:**
 
 - after `suspend_credit_line`, `draw_credit` for that borrower reverts
-- `repay_credit` remains allowed while suspended
-This repo contains the **credit** contract: it will maintain credit lines, track utilization, enforce limits, and expose methods for opening lines, drawing, repaying, and updating risk parameters. The contract includes core logic for state management and events; additional features like interest accrual and token transfers are future enhancements.
+- after `default_credit_line`, `draw_credit` reverts and `repay_credit` remains allowed
+- `repay_credit` remains allowed while suspended or defaulted
 
 **Contract data model:**
 
 - `CreditStatus`: Active, Suspended, Defaulted, Closed
 - `CreditLineData`: borrower, credit_limit, utilized_amount, interest_rate_bps, risk_score, status
 
-**Methods:** `init`, `open_credit_line`, `draw_credit`, `repay_credit`, `update_risk_parameters`, `suspend_credit_line`, `close_credit_line`, `default_credit_line`, `get_credit_line`.
+**Methods:** `init`, `open_credit_line`, `draw_credit`, `repay_credit`, `update_risk_parameters`, `suspend_credit_line`, `close_credit_line`, `default_credit_line`, `reinstate_credit_line`, `get_credit_line`.
 
 ## Tech Stack
 
