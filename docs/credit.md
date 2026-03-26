@@ -203,8 +203,8 @@ Sets the global rate-change limits. Admin-only.
 
 ---
 
-### `get_rate_change_limits(env) -> RateChangeConfig`
-Returns the current `RateChangeConfig`. Panics if none is set.
+### `get_rate_change_limits(env) -> Option<RateChangeConfig>`
+Returns the current `RateChangeConfig` when one has been configured. Returns `None` when no global rate-change limits have been set yet.
 
 ---
 
