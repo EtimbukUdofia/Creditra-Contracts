@@ -2200,4 +2200,134 @@ mod test {
             CreditStatus::Closed
         );
     }
+
+    // ========== coverage gap: set/get rate change limits ==========
+
+    /// set_rate_change_limits stores config; get_rate_change_limits returns it.
+    #[test]
+    fn test_set_and_get_rate_change_limits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.set_rate_change_limits(&500_u32, &3_600_u64);
+
+        let cfg = client.get_rate_change_limits().unwrap();
+        assert_eq!(cfg.max_rate_change_bps, 500);
+        assert_eq!(cfg.rate_change_min_interval, 3_600);
+    }
+
+    /// get_rate_change_limits returns None when no config has been set.
+    #[test]
+    fn test_get_rate_change_limits_returns_none_when_unset() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        assert!(client.get_rate_change_limits().is_none());
+    }
+
+    /// set_rate_change_limits must reject a non-admin caller.
+    #[test]
+    #[should_panic]
+    fn test_set_rate_change_limits_rejects_non_admin() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        env.mock_auths(&[]);
+        client.init(&admin);
+        client.set_rate_change_limits(&100_u32, &0_u64);
+    }
+
+    // ========== coverage gap: get_credit_line None branch ==========
+
+    /// get_credit_line returns None for an address with no credit line.
+    #[test]
+    fn test_get_credit_line_returns_none_for_unknown_borrower() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let unknown = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        assert!(client.get_credit_line(&unknown).is_none());
+    }
+
+    // ========== coverage gap: open_credit_line on non-Active existing line ==========
+
+    /// open_credit_line must succeed when the borrower has a Closed credit line
+    /// (the existing-line guard only blocks Active, not Closed/Suspended/Defaulted).
+    #[test]
+    fn test_open_credit_line_succeeds_after_closed_line() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000_i128, &300_u32, &70_u32);
+        client.close_credit_line(&borrower, &admin);
+        // Re-opening after Closed must succeed — guard only blocks Active.
+        client.open_credit_line(&borrower, &2_000_i128, &400_u32, &60_u32);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.credit_limit, 2_000);
+        assert_eq!(line.status, CreditStatus::Active);
+    }
+
+    // ========== coverage gap: update_risk_parameters credit_limit == 0 ==========
+
+    /// update_risk_parameters with credit_limit == 0 must succeed when utilized == 0.
+    #[test]
+    fn test_update_risk_parameters_zero_limit_when_no_utilization() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000_i128, &300_u32, &70_u32);
+        // credit_limit = 0 is non-negative and >= utilized (0), so must succeed.
+        client.update_risk_parameters(&borrower, &0_i128, &300_u32, &70_u32);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.credit_limit, 0);
+    }
+
+    // ========== coverage gap: draw_credit with no token configured (None branch) ==========
+
+    /// draw_credit with no liquidity token set takes the None branch and skips transfer.
+    #[test]
+    fn test_draw_credit_no_token_configured_skips_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000_i128, &300_u32, &70_u32);
+        // No set_liquidity_token call — token_address is None, transfer is skipped.
+        client.draw_credit(&borrower, &200_i128);
+
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            200
+        );
+    }
 }
