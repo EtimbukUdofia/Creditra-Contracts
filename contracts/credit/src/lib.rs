@@ -598,6 +598,67 @@ impl Credit {
     pub fn get_credit_line(env: Env, borrower: Address) -> Option<CreditLineData> {
         env.storage().persistent().get(&borrower)
     }
+
+    /// Withdraw available (un-utilized) funds from the reserve back to an authorized address.
+    ///
+    /// # Overview
+    /// Allows the admin to pull tokens from the configured liquidity reserve to any
+    /// destination address, provided the requested amount does not exceed the reserve
+    /// balance held by the contract.
+    ///
+    /// # Checks-Effects-Interactions (CEI)
+    /// 1. **Checks** – caller auth, token configured, amount positive, reserve balance sufficient.
+    /// 2. **Effects** – none (reserve balance is managed by the token contract; no internal
+    ///    accounting state changes are needed for a pure reserve withdrawal).
+    /// 3. **Interactions** – token transfer executed last.
+    ///
+    /// # Arguments
+    /// * `to`     – Destination address that will receive the tokens.
+    /// * `amount` – Number of tokens to transfer (must be > 0).
+    ///
+    /// # Errors
+    /// * [`ContractError::NotAdmin`]      – caller is not the stored admin.
+    /// * [`ContractError::InvalidAmount`] – `amount` is zero or negative.
+    /// * [`ContractError::InvalidConfiguration`] – no liquidity token has been configured.
+    /// * [`ContractError::OverLimit`]     – requested amount exceeds the reserve balance.
+    pub fn withdraw(env: Env, to: Address, amount: i128) {
+        // ── Checks ────────────────────────────────────────────────────────────
+        // 1. Caller must be the admin.
+        require_admin_auth(&env);
+
+        // 2. Amount must be positive.
+        if amount <= 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+
+        // 3. A liquidity token must be configured.
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::LiquidityToken)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::InvalidConfiguration));
+
+        // 4. Resolve the reserve source (defaults to the contract itself).
+        let reserve: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::LiquiditySource)
+            .unwrap_or_else(|| env.current_contract_address());
+
+        // 5. Reserve must hold enough balance.
+        let token_client = token::Client::new(&env, &token_address);
+        let balance = token_client.balance(&reserve);
+        if balance < amount {
+            panic_with_error!(&env, ContractError::OverLimit);
+        }
+
+        // ── Effects ───────────────────────────────────────────────────────────
+        // No internal state to update for a reserve withdrawal; the token
+        // contract is the authoritative source of balance truth.
+
+        // ── Interactions ──────────────────────────────────────────────────────
+        token_client.transfer(&reserve, &to, &amount);
+    }
 }
 
 #[cfg(test)]
@@ -607,7 +668,6 @@ mod test {
     use soroban_sdk::testutils::Events as _;
     use soroban_sdk::token;
     use soroban_sdk::token::StellarAssetClient;
-    use soroban_sdk::{Symbol, TryFromVal, TryIntoVal};
 
     fn setup_test(env: &Env) -> (Address, Address, Address) {
         env.mock_all_auths();
