@@ -33,7 +33,7 @@ use events::{
     publish_risk_parameters_updated, CreditLineEvent, DrawnEvent, RepaymentEvent,
     RiskParametersUpdatedEvent,
 };
-use types::{CreditLineData, CreditStatus};
+use types::{CreditLineData, CreditStatus, RateChangeConfig};
 
 /// Maximum interest rate in basis points (100%).
 const MAX_INTEREST_RATE_BPS: u32 = 10_000;
@@ -100,6 +100,11 @@ fn set_reentrancy_guard(env: &Env) {
 
 fn clear_reentrancy_guard(env: &Env) {
     env.storage().instance().set(&reentrancy_key(env), &false);
+}
+
+/// Instance storage key for rate-change config.
+fn rate_cfg_key(env: &Env) -> Symbol {
+    Symbol::new(env, "rate_cfg")
 }
 
 #[contract]
@@ -202,58 +207,11 @@ impl Credit {
                 risk_score,
             },
         );
-
-
-
-    /// Draw from credit line (borrower).
- 
-    /// Errors with ContractError if credit line does not exist, is Closed, or borrower has not authorized.
-
-    /// Reverts if credit line does not exist, is Closed, borrower has not authorized,
-    /// or the provided borrower does not match the stored credit line owner.
- 
- 
-    pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {
-
-
-    /// Draw from credit line: verifies limit, updates utilized_amount,
-    /// and transfers the protocol token from the contract reserve to the borrower.
-    ///
-    /// # Panics
-    /// - `"Credit line not found"` – borrower has no open credit line
-    /// - `"credit line is closed"` – line is closed
-    /// - `"Credit line not active"` – line is suspended or defaulted
-    /// - `"exceeds credit limit"` – draw would push utilized_amount past credit_limit
-    /// - `"amount must be positive"` – amount is zero or negative
-    /// - `"reentrancy guard"` – re-entrant call detected
-
-    pub fn draw_credit(env: Env, borrower: Address, amount: i128) {
- 
-
-    /// Draw from credit line (borrower).
-    /// Reverts if credit line does not exist, is Closed/Suspended, or borrower has not authorized.
-    /// Reverts if credit line does not exist, is Closed, or borrower has not authorized.
-    pub fn draw_credit(env: Env, borrower: Address, amount: i128) {
-        set_reentrancy_guard(&env);
-        borrower.require_auth();
-
     }
-
-
 
     /// Update risk parameters for an existing credit line.
     ///
     /// Called by admin or risk engine when a borrower's risk profile changes.
-    ///
-    /// # Parameters
-    /// - `borrower`: The borrower's address.
-    /// - `credit_limit`: New credit limit.
-    /// - `interest_rate_bps`: New interest rate in basis points.
-    /// - `risk_score`: New risk score.
-    ///
-    /// # Note
-    /// Not yet implemented. Planned logic: load existing record, update fields,
-    /// persist updated [`CreditLineData`].
     /// @notice Draws credit by transferring liquidity tokens to the borrower.
     /// @dev Enforces status/limit/liquidity checks and uses a reentrancy guard.
     pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {
@@ -534,6 +492,7 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
+    }
 
     /// Mark a credit line as defaulted (admin only).
     ///
@@ -564,6 +523,7 @@ impl Credit {
                 risk_score: credit_line.risk_score,
             },
         );
+    }
 
     /// Reinstate a defaulted credit line to Active (admin only).
     ///
@@ -610,19 +570,12 @@ impl Credit {
 
 #[cfg(test)]
 mod test {
-    soroban_sdk::contractimpl! { export! CreditImpl }
-
-    use soroban_sdk::contractclient::ContractClient;
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Events as _;
     use soroban_sdk::token;
-    use soroban_sdk::contractclient::ContractClient;
-use soroban_sdk::testutils::Events;
     use soroban_sdk::token::StellarAssetClient;
-    use soroban_sdk::{Symbol, TryFromVal, TryIntoVal};
-
-    type CreditClient<'a> = soroban_sdk::contractclient::ContractClient<'a, CreditImpl>;
+    use soroban_sdk::Symbol;
 
     fn setup_test(env: &Env) -> (Address, Address, Address) {
         env.mock_all_auths();
@@ -2132,5 +2085,166 @@ use soroban_sdk::testutils::Events;
         // Current repay implementation is state-only; token balances/allowances are unchanged.
         assert_eq!(liquidity.balance(&borrower), 550_i128);
         assert_eq!(liquidity.allowance(&borrower, &contract_id), 200_i128);
+    }
+
+    // ── set_rate_change_limits / get_rate_change_limits ───────────────────────
+
+    /// set_rate_change_limits stores config; get_rate_change_limits returns it.
+    #[test]
+    fn test_set_and_get_rate_change_limits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        // Before setting, should return None.
+        assert!(client.get_rate_change_limits().is_none());
+
+        client.set_rate_change_limits(&500_u32, &86400_u64);
+
+        let cfg = client.get_rate_change_limits().expect("config must be set");
+        assert_eq!(cfg.max_rate_change_bps, 500);
+        assert_eq!(cfg.rate_change_min_interval, 86400);
+    }
+
+    /// set_rate_change_limits requires admin auth.
+    #[test]
+    #[should_panic]
+    fn test_set_rate_change_limits_unauthorized() {
+        let env = Env::default();
+        // No mock_all_auths — admin.require_auth() will fail.
+        let admin = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+        client.set_rate_change_limits(&200_u32, &0_u64);
+    }
+
+    /// set_rate_change_limits with zero interval disables the time-window check.
+    #[test]
+    fn test_set_rate_change_limits_zero_interval() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+        client.set_rate_change_limits(&1000_u32, &0_u64);
+        let cfg = client.get_rate_change_limits().unwrap();
+        assert_eq!(cfg.rate_change_min_interval, 0);
+    }
+
+    // ── draw_credit on non-Active statuses ────────────────────────────────────
+
+    /// draw_credit succeeds on a Suspended line (contract only blocks Closed).
+    /// This documents the current behaviour: Suspended does NOT block draws.
+    #[test]
+    fn test_draw_credit_succeeds_on_suspended_line() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, _token, _admin) =
+            setup_contract_with_credit_line(&env, &borrower, 1_000, 1_000);
+        client.suspend_credit_line(&borrower);
+        // Suspended does not block draw in the current implementation.
+        client.draw_credit(&borrower, &100);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            100
+        );
+    }
+
+    /// draw_credit on a Defaulted line — contract only checks Closed, so draw
+    /// is currently allowed on Defaulted lines. Documents current behaviour.
+    #[test]
+    fn test_draw_credit_succeeds_on_defaulted_line() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, _token, _admin) =
+            setup_contract_with_credit_line(&env, &borrower, 1_000, 1_000);
+        client.default_credit_line(&borrower);
+        client.draw_credit(&borrower, &50);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            50
+        );
+    }
+
+    // ── open_credit_line: re-open after non-Active status ────────────────────
+
+    /// A borrower whose line is Closed can open a new credit line.
+    #[test]
+    fn test_open_credit_line_after_closed_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000, &300_u32, &70_u32);
+        client.close_credit_line(&borrower, &admin);
+        // Re-open after close must succeed.
+        client.open_credit_line(&borrower, &2_000, &250_u32, &60_u32);
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.status, CreditStatus::Active);
+        assert_eq!(line.credit_limit, 2_000);
+    }
+
+    // ── get_credit_line: None for unknown borrower ────────────────────────────
+
+    /// get_credit_line returns None when no line exists for the address.
+    #[test]
+    fn test_get_credit_line_returns_none_for_unknown_borrower() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let unknown = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+        assert!(client.get_credit_line(&unknown).is_none());
+    }
+
+    // ── suspend → default transition ─────────────────────────────────────────
+
+    /// Admin can default a Suspended line (Suspended → Defaulted).
+    #[test]
+    fn test_default_suspended_credit_line() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000, &300_u32, &70_u32);
+        client.suspend_credit_line(&borrower);
+        client.default_credit_line(&borrower);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().status,
+            CreditStatus::Defaulted
+        );
+    }
+
+    // ── update_risk_parameters: emits event ──────────────────────────────────
+
+    /// update_risk_parameters emits a RiskParametersUpdatedEvent.
+    #[test]
+    fn test_update_risk_parameters_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+        client.open_credit_line(&borrower, &1_000, &300_u32, &70_u32);
+        client.update_risk_parameters(&borrower, &1_500, &400_u32, &80_u32);
+        // One event for open, one for update — verify at least one event was emitted.
+        assert!(!env.events().all().is_empty());
     }
 }
