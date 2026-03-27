@@ -252,7 +252,7 @@ The `Credit` contract uses standard `u32` discriminants for standardized error h
 | Function | Caller |
 |---|---|
 | `init` | Deployer (once) |
-| `open_credit_line` | Backend / risk engine |
+| `open_credit_line` | Admin (backend/risk engine key) |
 | `draw_credit` | Borrower |
 | `repay_credit` | Borrower |
 | `update_risk_parameters` | Admin / risk engine |
@@ -264,7 +264,7 @@ The `Credit` contract uses standard `u32` discriminants for standardized error h
 | `get_rate_change_limits` | Anyone (view) |
 | `get_credit_line` | Anyone (view) |
 
-> Note: On-chain authorization via `require_auth()` is not yet enforced in all functions. This is planned for a future release.
+> Note: `open_credit_line` requires admin authorization (`require_auth`). The admin key is the backend/risk engine signer — borrowers cannot open their own credit lines.
 
 ---
 
