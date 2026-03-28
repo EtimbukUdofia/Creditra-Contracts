@@ -24,7 +24,6 @@ mod test_helpers {
     /// Get a CreditClient for the given contract address
     /// Note: CreditClient has a lifetime tied to Env, so we can't return it from functions
     /// Instead, create it inline where needed using: CreditClient::new(&env, &contract_id)
-
     /// Setup a test environment with initialized contract
     /// Returns (env, admin, borrower, contract_id)
     pub fn setup() -> (Env, Address, Address, Address) {
@@ -105,52 +104,12 @@ mod test_helpers {
 
 #[cfg(test)]
 mod property_tests {
-    use super::test_helpers::*;
-    use proptest::prelude::*;
-
-    // ========== Property Test Generators ==========
-
-    /// Generate valid credit limits (positive i128 values)
-    fn valid_credit_limit() -> impl Strategy<Value = i128> {
-        1i128..=1_000_000_000_i128 // Reasonable range for testing
-    }
-
-    /// Generate valid interest rates (0-10000 basis points)
-    fn valid_interest_rate() -> impl Strategy<Value = u32> {
-        0u32..=10_000u32
-    }
-
-    /// Generate valid risk scores (0-100)
-    fn valid_risk_score() -> impl Strategy<Value = u32> {
-        0u32..=100u32
-    }
-
-    /// Generate invalid credit limits (zero or negative)
-    fn invalid_credit_limit() -> impl Strategy<Value = i128> {
-        -1_000_000_i128..=0i128
-    }
-
-    /// Generate invalid interest rates (> 10000)
-    fn invalid_interest_rate() -> impl Strategy<Value = u32> {
-        10_001u32..=20_000u32
-    }
-
-    /// Generate invalid risk scores (> 100)
-    fn invalid_risk_score() -> impl Strategy<Value = u32> {
-        101u32..=200u32
-    }
-
-    /// Generate non-Active credit statuses
-    fn non_active_status() -> impl Strategy<Value = CreditStatus> {
-        prop_oneof![
-            Just(CreditStatus::Closed),
-            Just(CreditStatus::Suspended),
-            Just(CreditStatus::Defaulted),
-        ]
-    }
+    // Property test generators and tests will be added when property tests are implemented
+    // use super::test_helpers::*;
+    // use proptest::prelude::*;
 
     // ========== Property Tests ==========
-    // Property tests will be added in subsequent tasks
+    // Property test generators will be added when property tests are implemented
 
     // Smoke test to verify test infrastructure works
     #[test]
