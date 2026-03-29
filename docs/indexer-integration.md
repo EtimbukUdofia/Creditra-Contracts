@@ -1,63 +1,207 @@
-# Indexer Integration Guide
+# Indexer Integration Guide (Soroban Events)
 
-This document defines event-schema expectations for downstream indexers and
-analytics systems consuming the Credit contract.
+This guide explains how indexers subscribe to Credit contract events and decode:
 
-## Semver and Event Compatibility
+- `CreditLineEvent`
+- `DrawnEvent`
+- `RepaymentEvent`
+- `RiskParametersUpdatedEvent`
 
-- Existing event payloads are preserved as **v1** (no breaking field removal or
-  type changes).
-- Enriched payloads are emitted as **v2** on separate topics.
-- Indexers can migrate incrementally by consuming both families in parallel.
+Source of truth for schemas: `contracts/credit/src/events.rs`.
 
-## Topics and Payloads
+---
 
-### Lifecycle events
+## 1) Event channels and topics
 
-- `("credit", "opened")`, `("credit", "suspend")`, `("credit", "closed")`,
-  `("credit", "default")`, `("credit", "reinstate")` -> `CreditLineEvent` (v1)
-- `("credit", "opened_v2")`, `("credit", "suspend_v2")`,
-  `("credit", "closed_v2")`, `("credit", "default_v2")`,
-  `("credit", "reinstate_v2")` -> `CreditLineEventV2` (v2)
+The contract publishes Soroban events under a `credit` namespace.
 
-`CreditLineEventV2` adds:
+| Event payload | Topic tuple | Emitted by |
+|---|---|---|
+| `CreditLineEvent` | `("credit", "opened" \| "suspend" \| "closed" \| "default" \| "reinstate")` | `open_credit_line`, `suspend_credit_line`, `close_credit_line`, `default_credit_line`, `reinstate_credit_line` |
+| `DrawnEvent` | `("credit", "drawn")` | `draw_credit` |
+| `RepaymentEvent` | `("credit", "repay")` | `repay_credit` |
+| `RiskParametersUpdatedEvent` | `("credit", "risk_upd")` | `update_risk_parameters` |
 
-- `timestamp: u64`
-- `actor: Address` (caller identity for lifecycle transition)
-- `amount: i128` (currently `0` for lifecycle transitions)
+For `CreditLineEvent`, `event_type` in the payload mirrors the second topic symbol.
 
-### Draw events
+---
 
-- `("credit", "drawn")` -> `DrawnEvent` (v1)
-- `("credit", "drawn_v2")` -> `DrawnEventV2` (v2)
+## 2) Canonical field lists (from `events.rs`)
 
-`DrawnEventV2` adds identifier fields:
+### `CreditLineEvent`
 
-- `recipient: Address`
-- `reserve_source: Address`
+| Field | Type | Notes |
+|---|---|---|
+| `event_type` | `Symbol` | One of `opened`, `suspend`, `closed`, `default`, `reinstate` |
+| `borrower` | `Address` | Borrower account/contract address |
+| `status` | `CreditStatus` | Enum: `Active=0`, `Suspended=1`, `Defaulted=2`, `Closed=3` |
+| `credit_limit` | `i128` | Current credit limit |
+| `interest_rate_bps` | `u32` | Rate in basis points |
+| `risk_score` | `u32` | Risk score |
 
-### Repayment events
+### `DrawnEvent`
 
-- `("credit", "repay")` -> `RepaymentEvent` (v1)
-- `("credit", "repay_v2")` -> `RepaymentEventV2` (v2)
+| Field | Type | Notes |
+|---|---|---|
+| `borrower` | `Address` | Borrower address |
+| `amount` | `i128` | Draw amount |
+| `new_utilized_amount` | `i128` | Post-draw utilized amount |
+| `timestamp` | `u64` | Ledger timestamp at emit time |
 
-`RepaymentEventV2` adds:
+### `RepaymentEvent`
 
-- `payer: Address`
+| Field | Type | Notes |
+|---|---|---|
+| `borrower` | `Address` | Borrower address |
+| `amount` | `i128` | Repaid amount recorded by contract |
+| `new_utilized_amount` | `i128` | Post-repay utilized amount |
+| `timestamp` | `u64` | Ledger timestamp at emit time |
 
-### Risk update events
+### `RiskParametersUpdatedEvent`
 
-- `("credit", "risk_upd")` -> `RiskParametersUpdatedEvent` (v1)
-- `("credit", "risk_upd_v2")` -> `RiskParametersUpdatedEventV2` (v2)
+| Field | Type | Notes |
+|---|---|---|
+| `borrower` | `Address` | Borrower address |
+| `credit_limit` | `i128` | Updated limit |
+| `interest_rate_bps` | `u32` | Updated rate |
+| `risk_score` | `u32` | Updated score |
 
-`RiskParametersUpdatedEventV2` adds:
+---
 
-- `timestamp: u64`
-- `actor: Address` (admin that performed update)
+## 3) Subscription/query patterns
 
-## Indexer Migration Strategy
+Most indexers use RPC polling with cursor checkpoints.
 
-1. Keep v1 parsers active for backward compatibility.
-2. Add v2 parsers and store both payload versions.
-3. Prefer v2 fields for analytics dimensions requiring actor/timestamp/source.
-4. Deprecate v1 ingestion only after consumer parity is confirmed.
+### JSON-RPC `getEvents` example
+
+Use strict topic filters to reduce bandwidth and decode costs.
+
+```bash
+curl -s "$SOROBAN_RPC_URL" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":"credit-events-1",
+    "method":"getEvents",
+    "params":{
+      "startLedger":123456,
+      "filters":[
+        {
+          "type":"contract",
+          "contractIds":["'$CREDIT_CONTRACT_ID'"],
+          "topics":["credit"]
+        }
+      ],
+      "pagination":{"limit":100}
+    }
+  }'
+```
+
+To isolate one stream, filter by the second topic as well (for example `drawn`, `repay`, `risk_upd`).
+
+### JS SDK decode pattern (topic + value)
+
+```ts
+import { xdr, scValToNative } from "@stellar/stellar-sdk";
+
+type RawEvent = {
+  topic: string[];       // base64 XDR ScVal entries from RPC
+  value: string;         // base64 XDR ScVal payload from RPC
+  ledger: number;
+  id: string;
+};
+
+function decodeScVal(base64Xdr: string) {
+  return xdr.ScVal.fromXDR(base64Xdr, "base64");
+}
+
+function decodeEvent(evt: RawEvent) {
+  const topics = evt.topic.map((t) => scValToNative(decodeScVal(t)));
+  const data = scValToNative(decodeScVal(evt.value));
+
+  // topics[0] === "credit"
+  // topics[1] is one of: opened, suspend, closed, default, reinstate, drawn, repay, risk_upd
+  return { topics, data, ledger: evt.ledger, id: evt.id };
+}
+```
+
+### Rust XDR decode pattern
+
+```rust
+use stellar_xdr::{Limits, ReadXdr, ScVal};
+
+fn decode_scval_base64(input: &str) -> Result<ScVal, Box<dyn std::error::Error>> {
+    let bytes = base64::decode(input)?;
+    let scv = ScVal::read_xdr(&mut bytes.as_slice(), Limits::none())?;
+    Ok(scv)
+}
+```
+
+After decoding `ScVal`, map by topic pair to the corresponding strongly-typed event schema your indexer owns.
+
+---
+
+## 4) Recommended indexer pipeline
+
+1. Query from last finalized cursor (`startLedger` or `cursor`).
+2. Filter by `contractId` + topic prefix `credit`.
+3. Decode topic XDR and payload XDR.
+4. Route by second topic symbol:
+   - lifecycle: `opened|suspend|closed|default|reinstate` -> `CreditLineEvent`
+   - `drawn` -> `DrawnEvent`
+   - `repay` -> `RepaymentEvent`
+   - `risk_upd` -> `RiskParametersUpdatedEvent`
+5. Validate payload fields and ranges (for example non-negative numeric invariants where expected).
+6. Upsert into event store with idempotency key (`event.id` + ledger/tx metadata).
+7. Advance checkpoint only after durable write.
+
+---
+
+## 5) Versioning policy for schema/topic changes
+
+Use additive-first evolution and explicit version markers for breaking changes.
+
+- **Non-breaking changes**: adding optional fields at the end of payload structs is allowed; indexers should ignore unknown fields.
+- **Breaking changes**: rename/remove/retype fields, topic name changes, or semantic changes must introduce a new versioned stream.
+- **Topic versioning**: append version suffix in second topic symbol, for example `drawn_v2`, `repay_v2`, `risk_upd_v2`, or lifecycle `opened_v2` as needed.
+- **Dual-publish window**: publish both old and new versioned events during migration to allow indexers to cut over safely.
+- **Deprecation policy**: announce deprecation window in release notes and remove old stream only after downstream confirmation.
+
+Suggested contract for consumers:
+
+- Treat `(contract_id, topics[], tx_hash, event_index)` as unique identity.
+- Never assume field ordering beyond the documented schema.
+- Fail closed on unknown required fields for a known version.
+
+---
+
+## 6) Operational and security notes
+
+### Assumptions
+
+- RPC responses are eventually consistent and may be paginated.
+- Reorg/finality behavior follows network guarantees; consumers should delay irreversible side effects until desired confirmation depth.
+
+### Trust boundaries
+
+- **Trusted**: on-chain event content after consensus finality.
+- **Partially trusted**: RPC transport and availability (can drop, delay, or duplicate responses).
+- **Untrusted input**: decoded payloads before schema validation.
+
+### Failure modes and mitigations
+
+- **Duplicate delivery**: enforce idempotent writes keyed by event identity.
+- **Out-of-order pages**: use monotonic cursoring and deterministic sort by `(ledger, tx, event_index)` where available.
+- **Schema drift**: route by explicit topic version and keep per-version decoders.
+- **Decoder errors**: dead-letter unknown/invalid payloads with raw XDR retained for replay.
+- **Backfill gaps**: periodic reconciliation job over ledger ranges.
+
+---
+
+## 7) Quick checklist for integrators
+
+- Subscribe/query by `contractId` + `credit` topic namespace.
+- Implement decoders for `CreditLineEvent`, `DrawnEvent`, `RepaymentEvent`, `RiskParametersUpdatedEvent`.
+- Store raw XDR alongside normalized records for audit/replay.
+- Make ingestion idempotent and checkpointed.
+- Support versioned topic suffixes (`*_v2`, etc.) for future migrations.
