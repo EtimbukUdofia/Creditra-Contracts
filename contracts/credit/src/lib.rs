@@ -264,6 +264,16 @@ impl Credit {
     /// Repay credit (borrower).
     /// Reverts if credit line does not exist, is Closed, or borrower has not authorized.
     /// Reduces utilized_amount by amount (capped at 0). Emits RepaymentEvent.
+    ///
+    /// # Reentrancy Protection
+    /// This function uses a reentrancy guard to prevent re-entrant calls during
+    /// token transfers. If a token contract were to call back into this contract
+    /// during transfer, the guard would revert the transaction.
+    ///
+    /// # Security Notes
+    /// - Soroban token transfers (e.g. Stellar Asset Contract) do not invoke callbacks
+    /// - This guard is defense-in-depth for future token integrations
+    /// - Guard is cleared on all success and failure paths
     pub fn repay_credit(env: Env, borrower: Address, amount: i128) {
         // --- Reentrancy guard (defense-in-depth) ---
         set_reentrancy_guard(&env);
