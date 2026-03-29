@@ -295,6 +295,11 @@ like actor/source/timestamp identifiers) while keeping v1 payloads stable. See
 
 > Note: `open_credit_line` requires admin authorization (`require_auth`). The admin key is the backend/risk engine signer — borrowers cannot open their own credit lines.
 
+### Related Admin Workflows
+
+- Default lifecycle: `default_credit_line` → optional `suspend_credit_line` containment → `reinstate_credit_line` or `close_credit_line`.
+- Oracle-assisted default design: `docs/default-oracle.md`.
+
 ---
 
 ## Admin Rotation Proposal
