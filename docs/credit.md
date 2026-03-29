@@ -67,9 +67,26 @@ Sets the Stellar Asset Contract token used for draws and repayments (admin only)
 Sets the address that holds liquidity for draws and receives repayments (defaults to contract address).
 
 ### `open_credit_line(env, borrower, credit_limit, interest_rate_bps, risk_score)`
-Opens a new credit line for a borrower. Called by the backend/risk engine.
+Opens a new credit line for a borrower. Called by the backend or risk engine.
 
-Emits: `("credit", "opened")` event.
+| Parameter | Type | Description |
+|---|---|---|
+| `borrower` | `Address` | Borrower's address |
+| `credit_limit` | `i128` | Maximum drawable amount (must be > 0) |
+| `interest_rate_bps` | `u32` | Annual interest rate in basis points (0–10000) |
+| `risk_score` | `u32` | Risk score from the risk engine (0–100) |
+
+`last_rate_update_ts` is initialized to `0` (no rate update has occurred yet).
+
+#### Errors
+| Condition | Error |
+|---|---|
+| `credit_limit <= 0` | `ContractError::InvalidAmount` |
+| `interest_rate_bps > 10000` | `ContractError::RateTooHigh` |
+| `risk_score > 100` | `ContractError::ScoreTooHigh` |
+| Borrower already has an Active line | `ContractError::Unauthorized` |
+
+Emits: `("credit", "opened")` event with a `CreditLineEvent` payload.
 
 ### `draw_credit(env, borrower, amount)`
 Draw funds from an **Active** credit line. Caller must be the borrower.
