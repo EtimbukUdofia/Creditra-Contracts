@@ -2113,9 +2113,18 @@ mod test_e2e_lifecycle_happy {
     use soroban_sdk::token::{self, StellarAssetClient};
     use soroban_sdk::TryFromVal;
 
-    fn last_event_topic1(env: &Env) -> Symbol {
+    fn last_credit_event_topic1(env: &Env) -> Symbol {
         let events = env.events().all();
-        let (_contract, topics, _data) = events.last().unwrap();
+        let (_contract, topics, _data) = events
+            .iter()
+            .rev()
+            .find(|(_c, topics, _d)| {
+                topics.len() >= 2
+                    && Symbol::try_from_val(env, &topics.get(0).unwrap())
+                        .map(|s: Symbol| s == symbol_short!("credit"))
+                        .unwrap_or(false)
+            })
+            .expect("no credit event found");
         Symbol::try_from_val(env, &topics.get(1).unwrap()).unwrap()
     }
 
@@ -2147,7 +2156,7 @@ mod test_e2e_lifecycle_happy {
         assert_eq!(line.status, CreditStatus::Active);
         assert_eq!(line.utilized_amount, 0);
         assert_eq!(line.credit_limit, 1_000);
-        assert_eq!(last_event_topic1(&env), symbol_short!("opened"));
+        assert_eq!(last_credit_event_topic1(&env), symbol_short!("opened"));
 
         // ── Step 2: draw 600 ─────────────────────────────────────────────────
         client.draw_credit(&borrower, &600_i128);
@@ -2157,7 +2166,7 @@ mod test_e2e_lifecycle_happy {
         assert_eq!(line.utilized_amount, 600);
         assert_eq!(token.balance(&contract_id), 400_i128);
         assert_eq!(token.balance(&borrower), 600_i128);
-        assert_eq!(last_event_topic1(&env), symbol_short!("drawn"));
+        assert_eq!(last_credit_event_topic1(&env), symbol_short!("drawn"));
 
         // ── Step 3: full repay 600 ───────────────────────────────────────────
         // Borrower must approve the contract to pull tokens via transfer_from.
@@ -2169,13 +2178,13 @@ mod test_e2e_lifecycle_happy {
         assert_eq!(line.utilized_amount, 0);
         assert_eq!(token.balance(&borrower), 0_i128);
         assert_eq!(token.balance(&contract_id), 1_000_i128);
-        assert_eq!(last_event_topic1(&env), symbol_short!("repay"));
+        assert_eq!(last_credit_event_topic1(&env), symbol_short!("repay"));
 
         // ── Step 4: borrower self-closes (zero utilization) ──────────────────
         client.close_credit_line(&borrower, &borrower);
 
         let line = client.get_credit_line(&borrower).unwrap();
         assert_eq!(line.status, CreditStatus::Closed);
-        assert_eq!(last_event_topic1(&env), symbol_short!("closed"));
+        assert_eq!(last_credit_event_topic1(&env), symbol_short!("closed"));
     }
 }
