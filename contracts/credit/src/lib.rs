@@ -1180,7 +1180,7 @@ mod test {
 #[cfg(test)]
 mod test_smoke_coverage {
     use super::*;
-    use soroban_sdk::testutils::{Address as _};
+    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
 
     #[test]
