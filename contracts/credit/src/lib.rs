@@ -11,6 +11,8 @@
 
 mod events;
 pub mod types;
+#[cfg(test)]
+mod boundary_tests;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
@@ -112,11 +114,12 @@ impl Credit {
         risk_score: u32,
     ) {
         assert!(credit_limit > 0, "credit_limit must be greater than zero");
-        assert!(
-            interest_rate_bps <= 10_000,
-            "interest_rate_bps cannot exceed 10000 (100%)"
-        );
-        assert!(risk_score <= 100, "risk_score must be between 0 and 100");
+        if interest_rate_bps > MAX_INTEREST_RATE_BPS {
+            env.panic_with_error(ContractError::RateTooHigh);
+        }
+        if risk_score > MAX_RISK_SCORE {
+            env.panic_with_error(ContractError::ScoreTooHigh);
+        }
 
         // Prevent overwriting an existing Active credit line
         if let Some(existing) = env
@@ -425,16 +428,16 @@ impl Credit {
             .expect("Credit line not found");
 
         if credit_limit < 0 {
-            panic!("credit_limit must be non-negative");
+            env.panic_with_error(ContractError::NegativeLimit);
         }
         if credit_limit < credit_line.utilized_amount {
-            panic!("credit_limit cannot be less than utilized amount");
+            env.panic_with_error(ContractError::LimitDecreaseRequiresRepayment);
         }
         if interest_rate_bps > MAX_INTEREST_RATE_BPS {
-            panic!("interest_rate_bps exceeds maximum");
+            env.panic_with_error(ContractError::RateTooHigh);
         }
         if risk_score > MAX_RISK_SCORE {
-            panic!("risk_score exceeds maximum");
+            env.panic_with_error(ContractError::ScoreTooHigh);
         }
 
         // --- Rate-change limit enforcement (#17) ---
