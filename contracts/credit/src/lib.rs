@@ -117,11 +117,12 @@ impl Credit {
         risk_score: u32,
     ) {
         assert!(credit_limit > 0, "credit_limit must be greater than zero");
-        assert!(
-            interest_rate_bps <= 10_000,
-            "interest_rate_bps cannot exceed 10000 (100%)"
-        );
-        assert!(risk_score <= 100, "risk_score must be between 0 and 100");
+        if interest_rate_bps > MAX_INTEREST_RATE_BPS {
+            env.panic_with_error(ContractError::RateTooHigh);
+        }
+        if risk_score > MAX_RISK_SCORE {
+            env.panic_with_error(ContractError::ScoreTooHigh);
+        }
 
         // Prevent overwriting an existing Active credit line
         if let Some(existing) = env

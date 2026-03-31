@@ -930,3 +930,57 @@ Instance storage works correctly today because it is always cleared.
    and on persistent (on credit line access) before production deployment.
 
 You can also run all workspace tests from the repository root with `cargo test`.
+
+---
+
+## Error Reference
+
+This section documents all contract errors and their exact error codes for consistent error handling across integrations.
+
+### ContractError Enum
+
+| Error Code | Variant | Description | Trigger |
+|------------|---------|-------------|---------|
+| 1 | `Unauthorized` | Caller is not authorized to perform this action | Various admin-only operations |
+| 2 | `NotAdmin` | Caller does not have admin privileges | `require_admin_auth` checks |
+| 3 | `CreditLineNotFound` | The specified credit line was not found | Operations on non-existent credit lines |
+| 4 | `CreditLineClosed` | Action cannot be performed because the credit line is closed | Draw operations on closed lines |
+| 5 | `InvalidAmount` | The requested amount is invalid (e.g., zero or negative) | Amount validation in draw/repay |
+| 6 | `OverLimit` | The requested draw exceeds the available credit limit | Draw limit checks |
+| 7 | `NegativeLimit` | The credit limit cannot be negative | Credit limit validation |
+| 8 | `RateTooHigh` | The interest rate exceeds maximum allowed (10000 bps = 100%) | Rate bounds validation |
+| 9 | `ScoreTooHigh` | The risk score exceeds maximum allowed (100) | Score bounds validation |
+| 10 | `UtilizationNotZero` | Action cannot be performed because the credit line utilization is not zero | Certain admin operations |
+| 11 | `Reentrancy` | Reentrancy detected during cross-contract calls | Reentrancy guard |
+| 12 | `Overflow` | Math overflow occurred during calculation | Arithmetic operations |
+| 13 | `LimitDecreaseRequiresRepayment` | Credit limit decrease requires immediate repayment of excess amount | Limit decrease validation |
+
+### Rate and Score Validation
+
+**Interest Rate Bounds:**
+- Valid range: `0` to `10_000` basis points (0% to 100%)
+- Error on violation: `ContractError::RateTooHigh` (code 8)
+- Applied in: `open_credit_line`, `update_risk_parameters`
+
+**Risk Score Bounds:**
+- Valid range: `0` to `100`
+- Error on violation: `ContractError::ScoreTooHigh` (code 9)  
+- Applied in: `open_credit_line`, `update_risk_parameters`
+
+### Boundary Test Coverage
+
+The contract includes comprehensive table-driven tests that verify:
+
+1. **Exact boundary acceptance**: Values at the exact limits (0, 10000 bps, 100 score) are accepted
+2. **One-past boundary rejection**: Values one unit beyond limits (10001 bps, 101 score) are rejected
+3. **Error mapping consistency**: Both `open_credit_line` and `update_risk_parameters` use the same error types
+4. **Edge case validation**: Granular testing around boundary values (9999, 10000, 10001)
+
+For detailed test implementation, see `boundary_tests.rs` in the source code.
+
+### Error Handling Best Practices
+
+1. **Always check error codes**: Use the numeric error codes for reliable error handling
+2. **Handle RateTooHigh/ScoreTooHigh specifically**: These errors indicate input validation failures
+3. **Distinguish between error types**: `RateTooHigh` (8) vs `ScoreTooHigh` (9) for precise validation feedback
+4. **Test boundary conditions**: Include tests for exact bounds and one-past bounds in all integrations
