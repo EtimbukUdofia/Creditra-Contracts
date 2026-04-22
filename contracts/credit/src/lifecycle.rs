@@ -183,35 +183,3 @@ pub fn default_credit_line(env: Env, borrower: Address) {
     );
 }
 
-/// Reinstate a defaulted credit line to Active (admin only).
-///
-/// Allowed only when status is Defaulted. Transition: Defaulted → Active.
-pub fn reinstate_credit_line(env: Env, borrower: Address) {
-    require_admin_auth(&env);
-
-    let mut credit_line: CreditLineData = env
-        .storage()
-        .persistent()
-        .get(&borrower)
-        .expect("Credit line not found");
-
-    if credit_line.status != CreditStatus::Defaulted {
-        panic!("credit line is not defaulted");
-    }
-
-    credit_line.status = CreditStatus::Active;
-    env.storage().persistent().set(&borrower, &credit_line);
-
-    publish_credit_line_event(
-        &env,
-        (symbol_short!("credit"), symbol_short!("reinstate")),
-        CreditLineEvent {
-            event_type: symbol_short!("reinstate"),
-            borrower: borrower.clone(),
-            status: CreditStatus::Active,
-            credit_limit: credit_line.credit_limit,
-            interest_rate_bps: credit_line.interest_rate_bps,
-            risk_score: credit_line.risk_score,
-        },
-    );
-}

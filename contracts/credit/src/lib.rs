@@ -26,8 +26,8 @@ use soroban_sdk::{
 
 use crate::events::{
     publish_credit_line_event, publish_drawn_event, publish_interest_accrued_event,
-    publish_repayment_event, publish_risk_parameters_updated, CreditLineEvent,
-    DrawnEvent, InterestAccruedEvent, RepaymentEvent, RiskParametersUpdatedEvent,
+    publish_repayment_event, CreditLineEvent, DrawnEvent, InterestAccruedEvent,
+    RepaymentEvent,
 };
 use crate::storage::{clear_reentrancy_guard, set_reentrancy_guard, DataKey};
 use crate::types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
