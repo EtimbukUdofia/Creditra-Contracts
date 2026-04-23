@@ -11,6 +11,7 @@
 //! would revert.
 
 mod auth;
+mod borrow;
 mod config;
 mod events;
 mod lifecycle;
@@ -24,13 +25,13 @@ mod accrual;
 mod accrual_tests;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contractimpl, symbol_short, token, Address, Env, Symbol,
 };
 
-use events::{
-    publish_credit_line_event, publish_drawn_event, publish_repayment_event,
-    publish_risk_parameters_updated, CreditLineEvent, DrawnEvent, RepaymentEvent,
-    RiskParametersUpdatedEvent,
+use crate::events::{
+    publish_credit_line_event, publish_drawn_event, publish_interest_accrued_event,
+    publish_repayment_event, CreditLineEvent, DrawnEvent, InterestAccruedEvent,
+    RepaymentEvent,
 };
 use types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
 use auth::require_admin_auth;
@@ -41,6 +42,9 @@ const MAX_INTEREST_RATE_BPS: u32 = 10_000;
 
 /// Maximum risk score (0–100 scale).
 const MAX_RISK_SCORE: u32 = 100;
+
+/// Seconds in a standard year (365 days).
+const SECONDS_PER_YEAR: u64 = 31_536_000;
 
 /// Instance storage key for reentrancy guard.
 fn reentrancy_key(env: &Env) -> Symbol {
@@ -311,8 +315,22 @@ impl Credit {
             env.panic_with_error(ContractError::CreditLineClosed);
         }
 
-        // --- Compute effective repayment (cap at outstanding utilization) ---
-        // This prevents over-pulling tokens and keeps accounting correct.
+        // --- Accrue pending interest before applying repayment ---
+        // This ensures interest cannot be skipped or evaded through frequent repayments.
+        apply_pending_accrual(&env, &borrower);
+
+        // Reload credit line after potential accrual mutation
+        credit_line = env
+            .storage()
+            .persistent()
+            .get(&borrower)
+            .unwrap_or_else(|| {
+                clear_reentrancy_guard(&env);
+                env.panic_with_error(ContractError::CreditLineNotFound)
+            });
+
+        // --- Compute effective repayment (cap at total owed) ---
+        // Overpayments are capped to the total outstanding debt. No refund is issued.
         let effective_repay = if amount > credit_line.utilized_amount {
             credit_line.utilized_amount
         } else {
@@ -370,7 +388,7 @@ impl Credit {
             .utilized_amount
             .saturating_sub(effective_repay)
             .max(0);
-        credit_line.utilized_amount = new_utilized;
+
         env.storage().persistent().set(&borrower, &credit_line);
 
         // --- Emit event ---
@@ -378,9 +396,12 @@ impl Credit {
         publish_repayment_event(
             &env,
             RepaymentEvent {
-                borrower,
+                borrower: borrower.clone(),
                 amount: effective_repay,
-                new_utilized_amount: new_utilized,
+                interest_repaid,
+                principal_repaid,
+                new_utilized_amount: credit_line.utilized_amount,
+                new_accrued_interest: credit_line.accrued_interest,
                 timestamp,
             },
         );
@@ -512,6 +533,24 @@ mod test {
 
     fn approve(env: &Env, token: &Address, from: &Address, spender: &Address, amount: i128) {
         token::Client::new(env, token).approve(from, spender, &amount, &1_000_u32);
+    }
+
+    fn setup_contract_with_credit_line<'a>(
+        env: &'a Env,
+        borrower: &Address,
+        credit_limit: i128,
+        utilized_amount: i128,
+    ) -> (CreditClient<'a>, Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(env, &contract_id);
+        client.init(&admin);
+        client.open_credit_line(borrower, &credit_limit, &300_u32, &70_u32);
+        if utilized_amount > 0 {
+            client.draw_credit(borrower, &utilized_amount);
+        }
+        (client, contract_id, admin)
     }
 
     fn assert_utilization_invariants(line: &CreditLineData) {
@@ -873,7 +912,10 @@ mod test {
         let event: RepaymentEvent = data.try_into_val(&env).unwrap();
         assert_eq!(event.borrower, borrower);
         assert_eq!(event.amount, 400);
+        assert_eq!(event.interest_repaid, 0);
+        assert_eq!(event.principal_repaid, 400);
         assert_eq!(event.new_utilized_amount, 600); // 1000 - 400
+        assert_eq!(event.new_accrued_interest, 0);
     }
 
     #[test]
@@ -894,7 +936,10 @@ mod test {
         let event: RepaymentEvent = data.try_into_val(&env).unwrap();
 
         assert_eq!(event.amount, 200); // effective, not 500
+        assert_eq!(event.interest_repaid, 0);
+        assert_eq!(event.principal_repaid, 200);
         assert_eq!(event.new_utilized_amount, 0);
+        assert_eq!(event.new_accrued_interest, 0);
     }
 
     #[test]
@@ -1134,6 +1179,179 @@ mod test {
         assert_eq!(line.status, CreditStatus::Active);
         assert_utilization_invariants(&line);
     }
+
+    // ── Repayment Allocation Policy Tests ────────────────────────────────────
+
+    /// Helper: manually set accrued_interest on a credit line for testing allocation.
+    fn set_accrued_interest(env: &Env, contract_id: &Address, borrower: &Address, amount: i128) {
+        env.as_contract(contract_id, || {
+            let mut line: CreditLineData = env.storage().persistent().get(borrower).unwrap();
+            line.accrued_interest = amount;
+            env.storage().persistent().set(borrower, &line);
+        });
+    }
+
+    #[test]
+    fn repay_less_than_interest_reduces_interest_only() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, token, contract_id, _admin) = setup(&env, &borrower, 1_000, 1_000, 500);
+
+        // Manually set accrued interest to 200 (principal = 300)
+        set_accrued_interest(&env, &contract_id, &borrower, 200);
+
+        StellarAssetClient::new(&env, &token).mint(&borrower, &100);
+        approve(&env, &token, &borrower, &contract_id, 100);
+
+        client.repay_credit(&borrower, &100);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.accrued_interest, 100); // 200 - 100
+        assert_eq!(line.utilized_amount, 500); // total unchanged since interest only
+    }
+
+    #[test]
+    fn repay_exactly_interest_zeros_accrued_interest() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, token, contract_id, _admin) = setup(&env, &borrower, 1_000, 1_000, 500);
+
+        set_accrued_interest(&env, &contract_id, &borrower, 200);
+
+        StellarAssetClient::new(&env, &token).mint(&borrower, &200);
+        approve(&env, &token, &borrower, &contract_id, 200);
+
+        client.repay_credit(&borrower, &200);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.accrued_interest, 0);
+        assert_eq!(line.utilized_amount, 300); // 500 - 200 (all to interest)
+    }
+
+    #[test]
+    fn repay_interest_plus_partial_principal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, token, contract_id, _admin) = setup(&env, &borrower, 1_000, 1_000, 500);
+
+        set_accrued_interest(&env, &contract_id, &borrower, 200);
+
+        StellarAssetClient::new(&env, &token).mint(&borrower, &300);
+        approve(&env, &token, &borrower, &contract_id, 300);
+
+        client.repay_credit(&borrower, &300);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.accrued_interest, 0); // 200 - 200
+        assert_eq!(line.utilized_amount, 200); // 500 - 300
+    }
+
+    #[test]
+    fn repay_overpayment_capped_at_total_owed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, token, contract_id, _admin) = setup(&env, &borrower, 1_000, 1_000, 500);
+
+        set_accrued_interest(&env, &contract_id, &borrower, 200);
+
+        StellarAssetClient::new(&env, &token).mint(&borrower, &1_000);
+        approve(&env, &token, &borrower, &contract_id, 1_000);
+
+        client.repay_credit(&borrower, &1_000);
+
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.accrued_interest, 0);
+        assert_eq!(line.utilized_amount, 0);
+    }
+
+    #[test]
+    fn repay_event_contains_allocation_fields() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, token, contract_id, _admin) = setup(&env, &borrower, 1_000, 1_000, 500);
+
+        set_accrued_interest(&env, &contract_id, &borrower, 150);
+
+        StellarAssetClient::new(&env, &token).mint(&borrower, &300);
+        approve(&env, &token, &borrower, &contract_id, 300);
+
+        client.repay_credit(&borrower, &300);
+
+        let events = env.events().all();
+        let (_contract, _topics, data) = events.last().unwrap();
+        let event: RepaymentEvent = data.try_into_val(&env).unwrap();
+
+        assert_eq!(event.borrower, borrower);
+        assert_eq!(event.amount, 300);
+        assert_eq!(event.interest_repaid, 150);
+        assert_eq!(event.principal_repaid, 150);
+        assert_eq!(event.new_utilized_amount, 200); // 500 - 300
+        assert_eq!(event.new_accrued_interest, 0);
+    }
+
+    #[test]
+    fn repay_accrual_initializes_checkpoint_without_charging() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, token, contract_id, _admin) = setup(&env, &borrower, 1_000, 1_000, 400);
+
+        // last_accrual_ts should be 0 initially
+        let line_before = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line_before.last_accrual_ts, 0);
+        assert_eq!(line_before.accrued_interest, 0);
+
+        StellarAssetClient::new(&env, &token).mint(&borrower, &100);
+        approve(&env, &token, &borrower, &contract_id, 100);
+
+        client.repay_credit(&borrower, &100);
+
+        let line_after = client.get_credit_line(&borrower).unwrap();
+        // Checkpoint should be set but no retroactive interest charged
+        assert!(line_after.last_accrual_ts > 0);
+        assert_eq!(line_after.accrued_interest, 0);
+        assert_eq!(line_after.utilized_amount, 300);
+    }
+
+    #[test]
+    fn repay_after_time_elapse_accrues_interest_before_allocation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let borrower = Address::generate(&env);
+        let (client, token, contract_id, _admin) = setup(&env, &borrower, 10_000, 10_000, 1_000);
+
+        // First repay sets the accrual checkpoint
+        StellarAssetClient::new(&env, &token).mint(&borrower, &100);
+        approve(&env, &token, &borrower, &contract_id, 100);
+        client.repay_credit(&borrower, &100);
+
+        let line_after_first = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line_after_first.utilized_amount, 900);
+        assert_eq!(line_after_first.accrued_interest, 0);
+        let checkpoint = line_after_first.last_accrual_ts;
+        assert!(checkpoint > 0);
+
+        // Advance ledger timestamp by exactly one year
+        env.ledger().set_timestamp(checkpoint + SECONDS_PER_YEAR);
+
+        // At 300 bps (3%) on 900 principal, expected interest = floor(900 * 300 / 10000) = 27
+        StellarAssetClient::new(&env, &token).mint(&borrower, &200);
+        approve(&env, &token, &borrower, &contract_id, 200);
+        client.repay_credit(&borrower, &200);
+
+        let line_after_second = client.get_credit_line(&borrower).unwrap();
+        // Total owed before repay = 900 + 27 = 927
+        // Repay 200: interest first (27), then principal (173)
+        // New utilized = 927 - 200 = 727
+        // New accrued_interest = 0
+        assert_eq!(line_after_second.accrued_interest, 0);
+        assert_eq!(line_after_second.utilized_amount, 727);
+    }
 }
 
 #[cfg(test)]
@@ -1253,7 +1471,7 @@ mod test_smoke_coverage {
         client.init(&admin);
         client.open_credit_line(&borrower, &1000_i128, &500_u32, &60_u32);
         client.default_credit_line(&borrower);
-        client.reinstate_credit_line(&borrower);
+        client.reinstate_credit_line(&borrower, &CreditStatus::Active);
         assert_eq!(
             client.get_credit_line(&borrower).unwrap().status,
             CreditStatus::Active
