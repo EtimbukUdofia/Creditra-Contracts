@@ -141,6 +141,7 @@ Repay outstanding drawn funds.
 
 - The borrower must have approved the contract to pull tokens via `transfer_from`.
 - Tokens are transferred **before** state is updated. If the transfer fails, the call reverts with no state change.
+- Repayment failures due to insufficient allowance or balance do not alter `utilized_amount`, `accrued_interest`, or the credit line record.
 - Works even when no liquidity token is configured (state-only update).
 
 Emits: `("credit", "repay")` event with `RepaymentEvent` payload containing:
