@@ -25,6 +25,9 @@ pub fn update_risk_parameters(
         .get(&borrower)
         .expect("Credit line not found");
 
+    // Apply interest accrual before any mutation
+    credit_line = crate::accrual::apply_accrual(&env, credit_line);
+
     if credit_limit < 0 {
         panic!("credit_limit must be non-negative");
     }
@@ -77,22 +80,4 @@ pub fn update_risk_parameters(
             risk_score,
         },
     );
-}
-
-/// Set rate-change limits (admin only).
-///
-/// Configures the maximum allowed interest-rate change per call and the
-/// minimum time interval between consecutive rate changes.
-pub fn set_rate_change_limits(env: Env, max_rate_change_bps: u32, rate_change_min_interval: u64) {
-    require_admin_auth(&env);
-    let cfg = RateChangeConfig {
-        max_rate_change_bps,
-        rate_change_min_interval,
-    };
-    env.storage().instance().set(&rate_cfg_key(&env), &cfg);
-}
-
-/// Get the current rate-change limit configuration (view function).
-pub fn get_rate_change_limits(env: Env) -> Option<RateChangeConfig> {
-    env.storage().instance().get(&rate_cfg_key(&env))
 }
