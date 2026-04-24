@@ -72,6 +72,12 @@ pub fn draw_credit(env: Env, borrower: Address, amount: i128) {
     pub fn repay_credit(env: Env, borrower: Address, amount: i128) {
         set_reentrancy_guard(&env);
         borrower.require_auth();
+
+        if amount <= 0 {
+            clear_reentrancy_guard(&env);
+            panic!("amount must be positive");
+        }
+
         let mut credit_line: CreditLineData = env
             .storage()
             .persistent()
@@ -79,6 +85,7 @@ pub fn draw_credit(env: Env, borrower: Address, amount: i128) {
             .expect("Credit line not found");
 
         if credit_line.borrower != borrower {
+            clear_reentrancy_guard(&env);
             panic!("Borrower mismatch for credit line");
         }
 
@@ -86,11 +93,50 @@ pub fn draw_credit(env: Env, borrower: Address, amount: i128) {
             clear_reentrancy_guard(&env);
             panic!("credit line is closed");
         }
-        if amount <= 0 {
-            clear_reentrancy_guard(&env);
-            panic!("amount must be positive");
+
+        let effective_repay = if amount > credit_line.utilized_amount {
+            credit_line.utilized_amount
+        } else {
+            amount
+        };
+
+        if effective_repay > 0 {
+            let token_address: Option<Address> = env.storage().instance().get(&DataKey::LiquidityToken);
+            if let Some(token_address) = token_address {
+                let reserve_address: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::LiquiditySource)
+                    .unwrap_or_else(|| env.current_contract_address());
+
+                let token_client = token::Client::new(&env, &token_address);
+                let contract_address = env.current_contract_address();
+
+                // Guard: allowance must cover the effective repayment.
+                let allowance = token_client.allowance(&borrower, &contract_address);
+                if allowance < effective_repay {
+                    clear_reentrancy_guard(&env);
+                    panic!("Insufficient allowance");
+                }
+
+                // Guard: borrower must actually hold the tokens.
+                let balance = token_client.balance(&borrower);
+                if balance < effective_repay {
+                    clear_reentrancy_guard(&env);
+                    panic!("Insufficient balance");
+                }
+
+                // Pull tokens from borrower -> liquidity source via transfer_from.
+                token_client.transfer_from(
+                    &contract_address,
+                    &borrower,
+                    &reserve_address,
+                    &effective_repay,
+                );
+            }
         }
-        let new_utilized = credit_line.utilized_amount.saturating_sub(amount).max(0);
+
+        let new_utilized = credit_line.utilized_amount.saturating_sub(effective_repay).max(0);
         credit_line.utilized_amount = new_utilized;
         env.storage().persistent().set(&borrower, &credit_line);
 
@@ -99,12 +145,11 @@ pub fn draw_credit(env: Env, borrower: Address, amount: i128) {
             &env,
             RepaymentEvent {
                 borrower: borrower.clone(),
-                amount,
+                amount: effective_repay,
                 new_utilized_amount: new_utilized,
                 timestamp,
             },
         );
         clear_reentrancy_guard(&env);
-        // TODO: accept token from borrower
     }
 

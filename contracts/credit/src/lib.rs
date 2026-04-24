@@ -18,47 +18,26 @@ mod query;
 mod risk;
 mod storage;
 pub mod types;
-mod auth;
-mod storage;
 mod borrow;
-mod config;
-mod lifecycle;
-mod risk;
-mod query;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contractimpl, symbol_short, token, Address, Env, Symbol,
 };
 
-use events::{
+use crate::events::{
     publish_credit_line_event, publish_drawn_event, publish_repayment_event,
-    publish_risk_parameters_updated, CreditLineEvent, DrawnEvent, RepaymentEvent,
-    RiskParametersUpdatedEvent,
+    DrawnEvent, RepaymentEvent,
 };
-use types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
+use crate::storage::{
+    admin_key, clear_reentrancy_guard, rate_cfg_key, set_reentrancy_guard, DataKey,
+};
+use crate::types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
 
 /// Maximum interest rate in basis points (100%).
 const MAX_INTEREST_RATE_BPS: u32 = 10_000;
 
 /// Maximum risk score (0–100 scale).
 const MAX_RISK_SCORE: u32 = 100;
-
-/// Instance storage key for reentrancy guard.
-fn reentrancy_key(env: &Env) -> Symbol {
-    Symbol::new(env, "reentrancy")
-}
-
-/// Instance storage key for admin.
-fn admin_key(env: &Env) -> Symbol {
-    Symbol::new(env, "admin")
-}
-
-pub mod types;
-
-use crate::events::{publish_drawn_event, publish_repayment_event, DrawnEvent, RepaymentEvent};
-use crate::storage::{clear_reentrancy_guard, set_reentrancy_guard, DataKey};
-use crate::types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
-use soroban_sdk::{contract, contractimpl, token, Address, Env};
 
 #[contract]
 pub struct Credit;
@@ -116,52 +95,7 @@ impl Credit {
         interest_rate_bps: u32,
         risk_score: u32,
     ) {
-        assert!(credit_limit > 0, "credit_limit must be greater than zero");
-        if interest_rate_bps > MAX_INTEREST_RATE_BPS {
-            env.panic_with_error(ContractError::RateTooHigh);
-        }
-        if risk_score > MAX_RISK_SCORE {
-            env.panic_with_error(ContractError::ScoreTooHigh);
-        }
-
-        // Prevent overwriting an existing Active credit line
-        if let Some(existing) = env
-            .storage()
-            .persistent()
-            .get::<Address, CreditLineData>(&borrower)
-        {
-            assert!(
-                existing.status != CreditStatus::Active,
-                "borrower already has an active credit line"
-            );
-        }
-
-        let credit_line = CreditLineData {
-            borrower: borrower.clone(),
-            credit_limit,
-            utilized_amount: 0,
-            interest_rate_bps,
-            risk_score,
-            status: CreditStatus::Active,
-            last_rate_update_ts: 0,
-            accrued_interest: 0,
-            last_accrual_ts: 0,
-        };
-
-        env.storage().persistent().set(&borrower, &credit_line);
-
-        publish_credit_line_event(
-            &env,
-            (symbol_short!("credit"), symbol_short!("opened")),
-            CreditLineEvent {
-                event_type: symbol_short!("opened"),
-                borrower: borrower.clone(),
-                status: CreditStatus::Active,
-                credit_limit,
-                interest_rate_bps,
-                risk_score,
-            },
-        );
+        lifecycle::open_credit_line(env, borrower, credit_limit, interest_rate_bps, risk_score)
     }
 
     /// Update risk parameters for an existing credit line.
@@ -174,214 +108,17 @@ impl Credit {
     /// - `interest_rate_bps`: New interest rate in basis points.
     /// - `risk_score`: New risk score.
     ///
-    /// # Note
-    /// Not yet implemented. Planned logic: load existing record, update fields,
-    /// persist updated [`CreditLineData`].
     /// @notice Draws credit by transferring liquidity tokens to the borrower.
     /// @dev Enforces status/limit/liquidity checks and uses a reentrancy guard.
-    pub fn draw_credit(env: Env, borrower: Address, amount: i128) -> () {
-        set_reentrancy_guard(&env);
-        borrower.require_auth();
-
-        if amount <= 0 {
-            clear_reentrancy_guard(&env);
-            panic!("amount must be positive");
-        }
-
-        let token_address: Option<Address> = env.storage().instance().get(&DataKey::LiquidityToken);
-        let reserve_address: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::LiquiditySource)
-            .unwrap_or(env.current_contract_address());
-
-        let mut credit_line: CreditLineData = env
-            .storage()
-            .persistent()
-            .get(&borrower)
-            .unwrap_or_else(|| {
-                clear_reentrancy_guard(&env);
-                env.panic_with_error(ContractError::CreditLineNotFound)
-            });
-
-        if credit_line.borrower != borrower {
-            clear_reentrancy_guard(&env);
-            panic!("Borrower mismatch for credit line");
-        }
-
-        if credit_line.status == CreditStatus::Closed {
-            clear_reentrancy_guard(&env);
-            env.panic_with_error(ContractError::CreditLineClosed);
-        }
-
-        if credit_line.status == CreditStatus::Suspended {
-            clear_reentrancy_guard(&env);
-            panic!("credit line is suspended");
-        }
-
-        if credit_line.status == CreditStatus::Defaulted {
-            clear_reentrancy_guard(&env);
-            panic!("credit line is defaulted");
-        }
-
-        if credit_line.status != CreditStatus::Active {
-            clear_reentrancy_guard(&env);
-            env.panic_with_error(ContractError::InvalidAmount);
-        }
-
-        let updated_utilized = credit_line
-            .utilized_amount
-            .checked_add(amount)
-            .unwrap_or_else(|| {
-                clear_reentrancy_guard(&env);
-                env.panic_with_error(ContractError::Overflow)
-            });
-
-        if updated_utilized > credit_line.credit_limit {
-            clear_reentrancy_guard(&env);
-            panic!("exceeds credit limit");
-        }
-
-        if let Some(token_address) = token_address {
-            let token_client = token::Client::new(&env, &token_address);
-            let reserve_balance = token_client.balance(&reserve_address);
-            if reserve_balance < amount {
-                clear_reentrancy_guard(&env);
-                panic!("Insufficient liquidity reserve for requested draw amount");
-            }
-
-            token_client.transfer(&reserve_address, &borrower, &amount);
-        }
-
-        credit_line.utilized_amount = updated_utilized;
-        env.storage().persistent().set(&borrower, &credit_line);
-        let timestamp = env.ledger().timestamp();
-        publish_drawn_event(
-            &env,
-            DrawnEvent {
-                borrower,
-                amount,
-                new_utilized_amount: updated_utilized,
-                timestamp,
-            },
-        );
-        clear_reentrancy_guard(&env);
-        ()
+    pub fn draw_credit(env: Env, borrower: Address, amount: i128) {
+        borrow::draw_credit(env, borrower, amount)
     }
 
     /// Repay credit (borrower).
     /// Reverts if credit line does not exist, is Closed, or borrower has not authorized.
     /// Reduces utilized_amount by amount (capped at 0). Emits RepaymentEvent.
-    ///
-    /// # Reentrancy Protection
-    /// This function uses a reentrancy guard to prevent re-entrant calls during
-    /// token transfers. If a token contract were to call back into this contract
-    /// during transfer, the guard would revert the transaction.
-    ///
-    /// # Security Notes
-    /// - Soroban token transfers (e.g. Stellar Asset Contract) do not invoke callbacks
-    /// - This guard is defense-in-depth for future token integrations
-    /// - Guard is cleared on all success and failure paths
     pub fn repay_credit(env: Env, borrower: Address, amount: i128) {
-        // --- Reentrancy guard (defense-in-depth) ---
-        set_reentrancy_guard(&env);
-
-        // --- Auth: only the borrower may repay their own line ---
-        borrower.require_auth();
-
-        // --- Input validation ---
-        if amount <= 0 {
-            clear_reentrancy_guard(&env);
-            env.panic_with_error(ContractError::InvalidAmount);
-        }
-
-        // --- Load credit line ---
-        let mut credit_line: CreditLineData = env
-            .storage()
-            .persistent()
-            .get(&borrower)
-            .unwrap_or_else(|| {
-                clear_reentrancy_guard(&env);
-                env.panic_with_error(ContractError::CreditLineNotFound)
-            });
-
-        // --- Status check: only Closed is disallowed ---
-        if credit_line.status == CreditStatus::Closed {
-            clear_reentrancy_guard(&env);
-            env.panic_with_error(ContractError::CreditLineClosed);
-        }
-
-        // --- Compute effective repayment (cap at outstanding utilization) ---
-        // This prevents over-pulling tokens and keeps accounting correct.
-        let effective_repay = if amount > credit_line.utilized_amount {
-            credit_line.utilized_amount
-        } else {
-            amount
-        };
-
-        // --- Token transfer (when liquidity token is configured) ---
-        // We check allowance and balance *before* mutating state so that a
-        // failed transfer reverts cleanly without partial state changes.
-        if effective_repay > 0 {
-            let token_address: Option<Address> =
-                env.storage().instance().get(&DataKey::LiquidityToken);
-
-            if let Some(token_address) = token_address {
-                let reserve_address: Address = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::LiquiditySource)
-                    .unwrap_or_else(|| env.current_contract_address());
-
-                let token_client = token::Client::new(&env, &token_address);
-                let contract_address = env.current_contract_address();
-
-                // Guard: allowance must cover the effective repayment.
-                let allowance = token_client.allowance(&borrower, &contract_address);
-                if allowance < effective_repay {
-                    clear_reentrancy_guard(&env);
-                    panic!("Insufficient allowance");
-                }
-
-                // Guard: borrower must actually hold the tokens.
-                let balance = token_client.balance(&borrower);
-                if balance < effective_repay {
-                    clear_reentrancy_guard(&env);
-                    panic!("Insufficient balance");
-                }
-
-                // Pull tokens from borrower → liquidity source via transfer_from.
-                token_client.transfer_from(
-                    &contract_address,
-                    &borrower,
-                    &reserve_address,
-                    &effective_repay,
-                );
-            }
-        }
-
-        // --- Update state ---
-        let new_utilized = credit_line
-            .utilized_amount
-            .saturating_sub(effective_repay)
-            .max(0);
-        credit_line.utilized_amount = new_utilized;
-        env.storage().persistent().set(&borrower, &credit_line);
-
-        // --- Emit event ---
-        let timestamp = env.ledger().timestamp();
-        publish_repayment_event(
-            &env,
-            RepaymentEvent {
-                borrower,
-                amount: effective_repay,
-                new_utilized_amount: new_utilized,
-                timestamp,
-            },
-        );
-
-        // --- Release reentrancy guard ---
-        clear_reentrancy_guard(&env);
+        borrow::repay_credit(env, borrower, amount)
     }
 
     /// Update risk parameters for an existing credit line (admin only).
@@ -402,16 +139,6 @@ impl Credit {
     /// following additional checks are enforced whenever the interest rate is
     /// actually changing:
     /// * The absolute delta `|new_rate - old_rate|` must be ≤ `max_rate_change_bps`.
-    /// * If a minimum interval is configured and a previous rate change
-    ///   timestamp exists, the elapsed time since the last change must be ≥
-    ///   `rate_change_min_interval`.
-    ///
-    /// # Rate-change limits
-    /// When a `RateChangeConfig` has been set via `set_rate_change_limits`, the
-    /// following additional checks are enforced whenever the interest rate is
-    /// actually changing:
-    /// * The absolute delta `|new_rate - old_rate|` must be ≤
-    ///   `max_rate_change_bps`.
     /// * If a minimum interval is configured and a previous rate change
     ///   timestamp exists, the elapsed time since the last change must be ≥
     ///   `rate_change_min_interval`.
@@ -465,33 +192,7 @@ impl Credit {
     pub fn get_credit_line(env: Env, borrower: Address) -> Option<CreditLineData> {
         env.storage().persistent().get(&borrower)
     }
-
-    /// Reinstate a defaulted credit line to Active (admin only).
-    pub fn reinstate_credit_line(env: Env, borrower: Address) {
-        require_admin_auth(&env);
-        let mut credit_line: CreditLineData = env
-            .storage()
-            .persistent()
-            .get(&borrower)
-            .expect("Credit line not found");
-        if credit_line.status != CreditStatus::Defaulted {
-            panic!("credit line is not defaulted");
-        }
-        credit_line.status = CreditStatus::Active;
-        env.storage().persistent().set(&borrower, &credit_line);
-        publish_credit_line_event(
-            &env,
-            (symbol_short!("credit"), symbol_short!("reinstate")),
-            CreditLineEvent {
-                event_type: symbol_short!("reinstate"),
-                borrower: borrower.clone(),
-                status: CreditStatus::Active,
-                credit_limit: credit_line.credit_limit,
-                interest_rate_bps: credit_line.interest_rate_bps,
-                risk_score: credit_line.risk_score,
-            },
-        );
-    }
+}
 }
 
 #[cfg(test)]
