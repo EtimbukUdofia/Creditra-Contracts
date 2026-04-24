@@ -28,26 +28,25 @@ use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Env, Symbol,
 };
 
+use auth::{require_admin, require_admin_auth};
 use events::{
     publish_credit_line_event, publish_drawn_event, publish_repayment_event,
-    publish_risk_parameters_updated, CreditLineEvent, DrawnEvent, RepaymentEvent,
-    RiskParametersUpdatedEvent,
+    publish_risk_parameters_updated, publish_admin_rotation_proposed, publish_admin_rotation_accepted,
+    CreditLineEvent, DrawnEvent, RepaymentEvent, RiskParametersUpdatedEvent,
+    AdminRotationProposedEvent, AdminRotationAcceptedEvent,
 };
-use storage::{clear_reentrancy_guard, set_reentrancy_guard, rate_cfg_key, DataKey};
+use storage::{
+    clear_reentrancy_guard, set_reentrancy_guard, admin_key,
+    proposed_admin_key, proposed_at_key, rate_cfg_key, DataKey,
+};
 use types::{ContractError, CreditLineData, CreditStatus, RateChangeConfig};
 
 /// Maximum risk score (0–100 scale).
 const MAX_RISK_SCORE: u32 = 100;
 
-/// Instance storage key for reentrancy guard.
-fn reentrancy_key(env: &Env) -> Symbol {
-    Symbol::new(env, "reentrancy")
-}
 
-/// Instance storage key for admin.
-fn admin_key(env: &Env) -> Symbol {
-    Symbol::new(env, "admin")
-}
+
+
 
 #[contract]
 pub struct Credit;
