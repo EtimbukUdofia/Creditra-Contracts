@@ -1,5 +1,6 @@
 use crate::auth::{require_admin, require_admin_auth};
 use crate::events::{publish_credit_line_event, CreditLineEvent};
+use crate::storage::assert_not_paused;
 use crate::types::{CreditLineData, CreditStatus};
 use soroban_sdk::{symbol_short, Address, Env};
 
@@ -13,10 +14,12 @@ use soroban_sdk::{symbol_short, Address, Env};
 ///
 /// # Panics
 /// - If no credit line exists for the given borrower.
+/// - If the protocol is paused.
 ///
 /// # Events
 /// Emits a `("credit", "suspend")` [`CreditLineEvent`].
 pub fn suspend_credit_line(env: Env, borrower: Address) {
+    assert_not_paused(&env);
     require_admin_auth(&env);
     let mut credit_line: CreditLineData = env
         .storage()
@@ -58,10 +61,11 @@ pub fn suspend_credit_line(env: Env, borrower: Address) {
 ///
 /// # Errors
 /// * Panics if credit line does not exist, or if `closer` is not admin/borrower, or if
-///   borrower closes while `utilized_amount != 0`.
+///   borrower closes while `utilized_amount != 0`, or if the protocol is paused.
 ///
 /// Emits a CreditLineClosed event.
 pub fn close_credit_line(env: Env, borrower: Address, closer: Address) {
+    assert_not_paused(&env);
     closer.require_auth();
 
     let admin: Address = require_admin(&env);
@@ -107,11 +111,28 @@ pub fn close_credit_line(env: Env, borrower: Address, closer: Address) {
 
 /// Mark a credit line as defaulted (admin only).
 ///
-/// Call when the line is past due or when an oracle/off-chain signal indicates default.
-/// Transition: Active or Suspended → Defaulted.
-/// After this, draw_credit is disabled and repay_credit remains allowed.
-/// Emits a CreditLineDefaulted event.
+/// Transitions the credit line to [`CreditStatus::Defaulted`].
+///
+/// # Valid source statuses
+/// - [`CreditStatus::Active`] → Defaulted
+/// - [`CreditStatus::Suspended`] → Defaulted
+///
+/// Closed lines cannot be defaulted (they are permanently closed).
+/// Already-Defaulted lines are idempotent (no-op, no event emitted).
+///
+/// # Effects
+/// - `draw_credit` is disabled for the borrower after this call.
+/// - `repay_credit` remains allowed so the borrower can reduce their debt.
+///
+/// # Errors
+/// - Panics if the credit line does not exist.
+/// - Panics if the caller is not the contract admin.
+/// - Panics if the credit line is `Closed`.
+///
+/// # Events
+/// Emits `("credit", "default")` with a [`CreditLineEvent`] payload.
 pub fn default_credit_line(env: Env, borrower: Address) {
+    assert_not_paused(&env);
     require_admin_auth(&env);
     let mut credit_line: CreditLineData = env
         .storage()
@@ -121,6 +142,15 @@ pub fn default_credit_line(env: Env, borrower: Address) {
 
     // Apply interest accrual before any mutation
     credit_line = crate::accrual::apply_accrual(&env, credit_line);
+
+    if credit_line.status == CreditStatus::Closed {
+        panic!("cannot default a closed credit line");
+    }
+
+    if credit_line.status == CreditStatus::Defaulted {
+        // Idempotent: already defaulted, nothing to do.
+        return;
+    }
 
     credit_line.status = CreditStatus::Defaulted;
     env.storage().persistent().set(&borrower, &credit_line);
@@ -142,7 +172,11 @@ pub fn default_credit_line(env: Env, borrower: Address) {
 /// Reinstate a defaulted credit line to Active (admin only).
 ///
 /// Allowed only when status is Defaulted. Transition: Defaulted → Active.
+///
+/// # Panics
+/// - If the protocol is paused.
 pub fn reinstate_credit_line(env: Env, borrower: Address) {
+    assert_not_paused(&env);
     require_admin_auth(&env);
 
     let mut credit_line: CreditLineData = env
