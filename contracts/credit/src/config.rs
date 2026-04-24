@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![cfg_attr(coverage_nightly, coverage(off))]
+
 use crate::auth::require_admin_auth;
 use crate::storage::admin_key;
 use crate::storage::DataKey;

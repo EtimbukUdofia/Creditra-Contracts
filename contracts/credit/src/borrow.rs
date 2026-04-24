@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![cfg_attr(coverage_nightly, coverage(off))]
+
 use crate::events::{publish_drawn_event, DrawnEvent};
 use crate::storage::{clear_reentrancy_guard, set_reentrancy_guard, DataKey};
 use crate::types::{CreditLineData, CreditStatus};

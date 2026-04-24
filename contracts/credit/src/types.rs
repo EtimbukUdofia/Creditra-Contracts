@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![cfg_attr(coverage_nightly, coverage(off))]
+#![cfg_attr(coverage, allow(dead_code))]
 
 //! Core data types for the Credit contract.
 
